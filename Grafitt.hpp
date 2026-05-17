@@ -1030,45 +1030,194 @@ struct parse_output {
     std::size_t consumed = 0;
 };
 
+[[nodiscard]] inline std::string trim_copy(std::string_view sv) {
+    std::size_t b = 0;
+    std::size_t e = sv.size();
+    auto is_ws = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    };
+    while (b < e && is_ws(static_cast<unsigned char>(sv[b]))) ++b;
+    while (e > b && is_ws(static_cast<unsigned char>(sv[e - 1]))) --e;
+    return std::string{sv.substr(b, e - b)};
+}
+
 [[nodiscard]] inline std::optional<parse_output> parse_text(std::string_view text) {
-    if (text.empty()) return std::nullopt;
+    if (trim_copy(text).empty()) return std::nullopt;
 #if GRAFITT_HAS_MATCHERONI
     using namespace matcheroni;
-    using ws = Any<Atoms<' ', '\t'>>;
-    using alpha = Ranges<'a', 'z', 'A', 'Z', '_', '_'>;
-    using digit = Range<'0', '9'>;
-    using ident = Seq<alpha, Any<alpha, digit>>;
-    using path_stmt = Seq<Lit<"path">, ws, ident, ws, Lit<"->">, ws, ident, End>;
-
+    using ws = Any<Atoms<' ', '\t', '\n', '\r'>>;
+    using quoted = Seq<Atom<'"'>, Any<NotAtom<'"'>>, Atom<'"'>>;
+    using source = Seq<Lit<"in">, ws, quoted>;
+    using meta_name = Seq<Lit<".name">, ws, quoted>;
+    using meta_desc = Seq<Lit<".desc">, ws, quoted>;
+    using meta_graph = Seq<Lit<".graph">, ws, quoted>;
+    using meta_hdr = Seq<Lit<"---">, ws, Any<Or<meta_name, meta_desc, meta_graph, ws>>, Lit<"---">>;
+    using header = Any<ws, meta_hdr>;
+    using stmt = Seq<header, Or<Lit<"match">, Lit<"traverse">, Lit<"path">, Lit<"reachable">, Lit<"aggregate">>, ws, source, ws, Atom<'{'>, Any<NotAtom<'}'>>, Atom<'}'>, ws, End>;
     TextMatchContext ctx;
-    const auto span = utils::to_span(text);
-    if (!path_stmt::match(ctx, span).is_valid()) return std::nullopt;
-
-    auto trimmed = std::string{text};
-    auto arrow = trimmed.find("->");
-    if (arrow == std::string::npos) return std::nullopt;
-
-    auto lhs = trimmed.substr(4, arrow - 4);
-    auto rhs = trimmed.substr(arrow + 2);
-    auto trim = [](std::string s) {
-        auto is_ws = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
-        while (!s.empty() && is_ws(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
-        while (!s.empty() && is_ws(static_cast<unsigned char>(s.back()))) s.pop_back();
-        return s;
-    };
-    lhs = trim(std::move(lhs));
-    rhs = trim(std::move(rhs));
-    if (lhs.empty() || rhs.empty()) return std::nullopt;
+    if (!stmt::match(ctx, utils::to_span(text)).is_valid()) return std::nullopt;
+#else
+    if (trim_copy(text).empty()) return std::nullopt;
+#endif
 
     query q;
     q.source = std::string{text};
-    q.kind = query_kind::path;
-    q.body = path_clause{std::move(lhs), std::move(rhs), true, std::nullopt};
+    std::string s = std::string{text};
+    auto extract_quoted = [&](std::string_view line) -> std::optional<std::string> {
+        auto first = line.find('"');
+        if (first == std::string_view::npos) return std::nullopt;
+        auto second = line.find('"', first + 1);
+        if (second == std::string_view::npos || second <= first + 1) return std::nullopt;
+        return std::string{line.substr(first + 1, second - first - 1)};
+    };
+
+    std::istringstream iss(s);
+    std::string line;
+    while (std::getline(iss, line)) {
+        auto t = trim_copy(line);
+        if (t.rfind(".name", 0) == 0) q.meta.name = extract_quoted(t);
+        if (t.rfind(".desc", 0) == 0) q.meta.desc = extract_quoted(t);
+        if (t.rfind(".graph", 0) == 0) q.meta.graph = extract_quoted(t);
+    }
+
+    auto kind_from = trim_copy(s);
+    if (kind_from.rfind("path", 0) == 0 || kind_from.find("\npath") != std::string::npos) {
+        q.kind = query_kind::path;
+    } else if (kind_from.rfind("traverse", 0) == 0 || kind_from.find("\ntraverse") != std::string::npos) {
+        q.kind = query_kind::traversal;
+    } else if (kind_from.rfind("reachable", 0) == 0 || kind_from.find("\nreachable") != std::string::npos) {
+        q.kind = query_kind::reachability;
+    } else if (kind_from.rfind("aggregate", 0) == 0 || kind_from.find("\naggregate") != std::string::npos) {
+        q.kind = query_kind::aggregation;
+    } else {
+        q.kind = query_kind::pattern;
+    }
+
+    auto body_start = s.find('{');
+    auto body_end = s.rfind('}');
+    std::string body = (body_start != std::string::npos && body_end != std::string::npos && body_end > body_start)
+        ? s.substr(body_start + 1, body_end - body_start - 1)
+        : "";
+
+    if (q.kind == query_kind::path) {
+        std::string from;
+        std::string to;
+        bool shortest = body.find("shortest") != std::string::npos;
+        std::istringstream bss(body);
+        while (std::getline(bss, line)) {
+            auto t = trim_copy(line);
+            if (t.rfind("from", 0) == 0) from = extract_quoted(t).value_or("");
+            if (t.rfind("to", 0) == 0) to = extract_quoted(t).value_or("");
+        }
+        if (from.empty() || to.empty()) return std::nullopt;
+        q.body = path_clause{std::move(from), std::move(to), shortest, std::nullopt};
+    } else if (q.kind == query_kind::traversal) {
+        std::string from;
+        std::size_t depth = 1;
+        std::istringstream bss(body);
+        while (std::getline(bss, line)) {
+            auto t = trim_copy(line);
+            if (t.rfind("from", 0) == 0) from = extract_quoted(t).value_or("");
+            if (t.rfind("depth", 0) == 0) depth = static_cast<std::size_t>(std::stoull(trim_copy(t.substr(5))));
+        }
+        if (from.empty()) return std::nullopt;
+        q.body = traversal_clause{std::move(from), depth, std::nullopt, std::nullopt};
+    } else if (q.kind == query_kind::reachability) {
+        std::string from;
+        std::string to;
+        std::size_t depth = 0;
+        std::istringstream bss(body);
+        while (std::getline(bss, line)) {
+            auto t = trim_copy(line);
+            if (t.rfind("from", 0) == 0) from = extract_quoted(t).value_or("");
+            if (t.rfind("to", 0) == 0) to = extract_quoted(t).value_or("");
+            if (t.rfind("depth", 0) == 0) depth = static_cast<std::size_t>(std::stoull(trim_copy(t.substr(5))));
+        }
+        if (from.empty() || to.empty()) return std::nullopt;
+        q.body = reachability_clause{std::move(from), std::move(to), depth};
+    } else if (q.kind == query_kind::aggregation) {
+        std::istringstream bss(body);
+        std::string op;
+        std::string target;
+        while (std::getline(bss, line)) {
+            auto t = trim_copy(line);
+            if (!t.empty()) {
+                std::istringstream lss(t);
+                lss >> op >> target;
+                break;
+            }
+        }
+        if (op.empty() || target.empty()) return std::nullopt;
+        q.body = aggregation_clause{std::move(op), std::move(target), std::nullopt, std::nullopt};
+    } else {
+        pattern_clause p;
+        std::istringstream bss(body);
+        while (std::getline(bss, line)) {
+            auto t = trim_copy(line);
+            if (t.rfind("vertices", 0) == 0) {
+                std::istringstream lss(t);
+                std::string kw;
+                std::string type_with_colon;
+                lss >> kw >> p.count >> type_with_colon;
+                if (!type_with_colon.empty() && type_with_colon[0] == ':') p.vertex_type = type_with_colon.substr(1);
+            } else if (t.rfind("edge", 0) == 0) {
+                p.edge_predicate = predicate_expr{t};
+            } else if (t.rfind("where", 0) == 0) {
+                p.where_predicate = predicate_expr{t};
+            }
+        }
+        q.body = std::move(p);
+    }
+
     return parse_output{std::move(q), text.size()};
-#else
-    (void)text;
-    return std::nullopt;
-#endif
+}
+
+template<class Graph, class LabelOf, class VertexPred, class EdgePred>
+[[nodiscard]] inline result<typename Graph::vertex_type, typename Graph::edge_label_type>
+execute(const Graph& g, const query& q, LabelOf&& label_of, VertexPred&& vpred, EdgePred&& epred) {
+    using V = typename Graph::vertex_type;
+    using E = typename Graph::edge_label_type;
+    if (q.kind == query_kind::traversal) {
+        const auto& c = std::get<traversal_clause>(q.body);
+        auto src = algo::find_vertex_by_label(g, c.from, std::forward<LabelOf>(label_of));
+        if (!src) return std::vector<V>{};
+        auto order = algo::bfs_order(g, *src);
+        if (c.depth < order.size()) order.resize(c.depth + 1);
+        return order;
+    }
+    if (q.kind == query_kind::path) {
+        const auto& c = std::get<path_clause>(q.body);
+        auto src = algo::find_vertex_by_label(g, c.from, std::forward<LabelOf>(label_of));
+        auto dst = algo::find_vertex_by_label(g, c.to, std::forward<LabelOf>(label_of));
+        if (!src || !dst) return std::vector<path_result<V>>{};
+        auto sp = algo::shortest_path(g, *src, *dst);
+        if (!sp) return std::vector<path_result<V>>{};
+        return std::vector<path_result<V>>{path_result<V>{*sp}};
+    }
+    if (q.kind == query_kind::reachability) {
+        const auto& c = std::get<reachability_clause>(q.body);
+        auto src = algo::find_vertex_by_label(g, c.from, std::forward<LabelOf>(label_of));
+        auto dst = algo::find_vertex_by_label(g, c.to, std::forward<LabelOf>(label_of));
+        if (!src || !dst) return false;
+        return algo::reachable(g, *src, *dst);
+    }
+    if (q.kind == query_kind::aggregation) {
+        const auto& c = std::get<aggregation_clause>(q.body);
+        if (c.op == "count" && c.target == "vertices") return scalar_result{static_cast<std::int64_t>(g.nb_vertex())};
+        if (c.op == "count" && c.target == "edges") return scalar_result{static_cast<std::int64_t>(g.nb_edges())};
+        throw query_error("unsupported aggregation");
+    }
+    std::vector<match_result<V, E>> out;
+    g.iter_edges_e([&](const auto& e) {
+        if (std::invoke(vpred, e.src) && std::invoke(vpred, e.dst) && std::invoke(epred, e, e.label)) {
+            match_result<V, E> m;
+            m.vertices.push_back(e.src);
+            m.vertices.push_back(e.dst);
+            m.edges.push_back(e);
+            out.push_back(std::move(m));
+        }
+    });
+    return out;
 }
 
 } // namespace queryfitt
@@ -1086,8 +1235,22 @@ struct rule {
 };
 
 template<class Graph>
-[[nodiscard]] inline Graph apply_once(const Graph& g, const rule&) {
-    return g;
+[[nodiscard]] inline Graph apply_once(const Graph& g, const rule& r) {
+    Graph out = g;
+    if (r.replacement.empty()) return out;
+    const auto arrow = r.replacement.find("->");
+    if (arrow == std::string::npos) return out;
+    auto lhs = queryfitt::trim_copy(std::string_view{r.replacement}.substr(0, arrow));
+    auto rhs = queryfitt::trim_copy(std::string_view{r.replacement}.substr(arrow + 2));
+    if (lhs.empty() || rhs.empty()) return out;
+    if constexpr (std::is_same_v<typename Graph::vertex_type, std::string>) {
+        if (!out.mem_vertex(lhs)) return out;
+        out.add_vertex(rhs);
+        auto succ_edges = out.succ_e(lhs);
+        for (const auto& e : succ_edges) out.remove_edge_e(e);
+        out.add_edge(lhs, rhs);
+    }
+    return out;
 }
 
 } // namespace rewrite
@@ -1110,13 +1273,77 @@ inline std::filesystem::path default_schema_path() {
 }
 
 template<class Graph>
-[[nodiscard]] inline std::vector<std::uint8_t> serialize(const Graph&) {
-    return {};
+[[nodiscard]] inline std::vector<std::uint8_t> serialize(const Graph& g) {
+    std::vector<std::uint8_t> out;
+    auto emit_u8 = [&](std::uint8_t v) { out.push_back(v); };
+    auto emit_u32 = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) emit_u8(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF));
+    };
+    auto emit_str = [&](const std::string& s) {
+        emit_u32(static_cast<std::uint32_t>(s.size()));
+        out.insert(out.end(), s.begin(), s.end());
+    };
+    out.insert(out.end(), {'G', 'B', 'I', 'N'});
+    emit_u8(1);
+    emit_u8(g.is_directed() ? 1 : 0);
+    emit_u32(static_cast<std::uint32_t>(g.nb_vertex()));
+    emit_u32(static_cast<std::uint32_t>(g.nb_edges()));
+    g.iter_vertex([&](const auto& v) { emit_str(to_string_fallback(v)); });
+    g.iter_edges_e([&](const auto& e) {
+        emit_str(to_string_fallback(e.src));
+        emit_str(to_string_fallback(e.dst));
+        emit_str(to_string_fallback(e.label));
+    });
+    return out;
 }
 
 template<class Graph>
-[[nodiscard]] inline std::optional<Graph> deserialize(const std::vector<std::uint8_t>&) {
-    return std::nullopt;
+[[nodiscard]] inline std::optional<Graph> deserialize(const std::vector<std::uint8_t>& bytes) {
+    static_assert(std::is_same_v<typename Graph::vertex_type, std::string>, "GBIN deserialize currently requires std::string vertices");
+    static_assert(std::is_same_v<typename Graph::edge_label_type, std::string> || std::is_same_v<typename Graph::edge_label_type, unit>,
+        "GBIN deserialize currently supports edge labels of std::string or unit");
+    std::size_t i = 0;
+    auto take_u8 = [&]() -> std::optional<std::uint8_t> {
+        if (i >= bytes.size()) return std::nullopt;
+        return bytes[i++];
+    };
+    auto take_u32 = [&]() -> std::optional<std::uint32_t> {
+        if (i + 4 > bytes.size()) return std::nullopt;
+        std::uint32_t v = 0;
+        for (int b = 0; b < 4; ++b) v |= static_cast<std::uint32_t>(bytes[i++]) << (8 * b);
+        return v;
+    };
+    auto take_str = [&]() -> std::optional<std::string> {
+        auto n = take_u32();
+        if (!n || i + *n > bytes.size()) return std::nullopt;
+        std::string s(bytes.begin() + static_cast<std::ptrdiff_t>(i), bytes.begin() + static_cast<std::ptrdiff_t>(i + *n));
+        i += *n;
+        return s;
+    };
+    if (bytes.size() < 10) return std::nullopt;
+    if (!(bytes[0] == 'G' && bytes[1] == 'B' && bytes[2] == 'I' && bytes[3] == 'N')) return std::nullopt;
+    i = 4;
+    auto version = take_u8();
+    auto dir = take_u8();
+    if (!version || *version != 1 || !dir) return std::nullopt;
+    auto vcount = take_u32();
+    auto ecount = take_u32();
+    if (!vcount || !ecount) return std::nullopt;
+    Graph g((*dir == 1) ? direction::directed : direction::undirected);
+    for (std::uint32_t v = 0; v < *vcount; ++v) {
+        auto name = take_str();
+        if (!name) return std::nullopt;
+        g.add_vertex(*name);
+    }
+    for (std::uint32_t e = 0; e < *ecount; ++e) {
+        auto src = take_str();
+        auto dst = take_str();
+        auto lbl = take_str();
+        if (!src || !dst || !lbl) return std::nullopt;
+        if constexpr (std::is_same_v<typename Graph::edge_label_type, std::string>) g.add_edge(*src, *dst, *lbl);
+        else g.add_edge(*src, *dst);
+    }
+    return g;
 }
 
 } // namespace gbin

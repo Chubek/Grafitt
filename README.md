@@ -6,8 +6,8 @@ Current repository focus:
 - explicit mutable (`imperative_graph`) and immutable (`persistent_graph`) APIs
 - small builder helpers
 - traversal/query utilities
-- Queryfitt AST + minimal textual parser boundary
-- rewrite and GBIN hooks prepared for incremental implementation
+- Queryfitt AST + textual query parsing/execution
+- concrete rewrite and GBIN v1 support
 
 ## Status
 
@@ -18,14 +18,10 @@ Implemented now:
 - mutable and immutable graph interfaces
 - OCamlGraph-style iteration/fold helpers
 - core algorithms (`reachable`, `shortest_path`, `bfs_order`)
-- Queryfitt AST and one minimal Matcheroni-backed parser path (`path a -> b`)
-- rewrite rule placeholder API
-- schema lookup hooks for GBIN (`GRAFITT_SCHEMA_DIR`, fallback `specs/`)
-
-Intentionally minimal/placeholders for later slices:
-- full textual Queryfitt grammar execution
-- concrete rewrite execution engine
-- concrete GBIN byte format serializer/deserializer
+- Queryfitt textual parsing for `match` / `traverse` / `path` / `reachable` / `aggregate`
+- Queryfitt execution for traversal, shortest path, reachability, basic aggregation, and edge-oriented pattern matches
+- concrete rewrite `apply_once()` behavior for string-vertex graphs (`lhs->rhs`)
+- GBIN v1 serializer/deserializer with schema lookup hooks (`GRAFITT_SCHEMA_DIR`, fallback `specs/`)
 
 ## Layout
 
@@ -148,7 +144,7 @@ int main() {
 }
 ```
 
-## Queryfitt (Current Slice)
+## Queryfitt
 
 ### C++ query construction
 
@@ -162,51 +158,82 @@ int main() {
 }
 ```
 
-### Text query parsing
+### Text query parsing and execution
 
-`parse_text()` currently supports a narrow Matcheroni-backed structural form:
-- valid shape: `path <ident> -> <ident>`
-
-```cpp
-#include "Grafitt.hpp"
-
-int main() {
-    auto ok = grafitt::queryfitt::parse_text("path a -> b");
-    auto bad = grafitt::queryfitt::parse_text("traverse from a");
-    return (ok.has_value() && !bad.has_value()) ? 0 : 1;
-}
-```
-
-This keeps parsing/semantics separation explicit:
-- Matcheroni checks structure
-- AST conversion happens after a successful match
-
-## Rewriting (Placeholder API)
+`parse_text()` accepts the textual style used in `examples/*.qfitt`:
+- optional metadata block (`--- ... ---`)
+- `match`, `traverse`, `path`, `reachable`, `aggregate`
+- `in "..." { ... }` body with clause-specific fields
 
 ```cpp
 #include "Grafitt.hpp"
+#include <string>
 
 int main() {
-    grafitt::rewrite::rule r {
-        .name = "noop",
-        .match = grafitt::queryfitt::shortest_path_between("a", "b"),
-        .replacement = "no-op"
-    };
+    using G = grafitt::imperative_graph<std::string, std::string>;
+    G g;
+    g.add_edge("Alice", "Bob", "knows");
+    g.add_edge("Bob", "Carol", "knows");
 
-    grafitt::imperative_graph<int> g;
-    auto g2 = grafitt::rewrite::apply_once(g, r); // currently returns input graph
-    (void)g2;
+    auto parsed = grafitt::queryfitt::parse_text(
+        "path in \"my-graphs/friendship-graph.gbin\" {\n"
+        "  from \"Alice\"\n"
+        "  to \"Carol\"\n"
+        "  shortest\n"
+        "}\n"
+    );
+    if (!parsed) return 1;
+
+    auto result = grafitt::queryfitt::execute(
+        g,
+        parsed->value,
+        [](const std::string& v) { return v; },
+        [](const std::string&) { return true; },
+        [](const auto&, const auto&) { return true; }
+    );
+    (void)result;
     return 0;
 }
 ```
 
-## GBIN Hooks and Schema Lookup
+## Rewriting
 
-`grafitt::gbin` provides narrow integration points:
+```cpp
+#include "Grafitt.hpp"
+#include <string>
+
+int main() {
+    using G = grafitt::imperative_graph<std::string, std::string>;
+    G g;
+    g.add_edge("a", "b", "x");
+    g.add_edge("a", "c", "y");
+
+    grafitt::rewrite::rule r {
+        .name = "redirect-a",
+        .match = grafitt::queryfitt::shortest_path_between("a", "b"),
+        .replacement = "a->z"
+    };
+
+    auto g2 = grafitt::rewrite::apply_once(g, r);
+    return g2.mem_edge("a", "z") ? 0 : 1;
+}
+```
+
+## GBIN and Schema Lookup
+
+`grafitt::gbin` provides:
 - `schema_root()`
 - `default_schema_path()`
-- `serialize(graph)` (placeholder)
-- `deserialize<Graph>(bytes)` (placeholder)
+- `serialize(graph)` (GBIN v1 bytes)
+- `deserialize<Graph>(bytes)` (currently `std::string` vertices, label `std::string` or `unit`)
+
+GBIN v1 layout:
+- magic: `GBIN`
+- version: `1`
+- directed flag: `0|1`
+- vertex count (`u32`, little-endian)
+- edge count (`u32`, little-endian)
+- vertices and edges as length-prefixed strings
 
 Environment variable:
 - `GRAFITT_SCHEMA_DIR`: custom schema directory
@@ -236,7 +263,9 @@ int main() {
 After editing `Grafitt.hpp` or parser-related code, run at least:
 - header include/compile smoke
 - one mutable + immutable behavior check
-- one valid + invalid Queryfitt parse check
+- one Queryfitt parse+execute check
+- one rewrite check
+- one GBIN round-trip check
 
 A minimal compile smoke:
 
