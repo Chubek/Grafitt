@@ -14,6 +14,7 @@
 #include <cctype>
 #include <concepts>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -53,6 +54,14 @@
 #  define GRAFITT_HAS_SERDETK 1
 #else
 #  define GRAFITT_HAS_SERDETK 0
+#endif
+
+#if __has_include("matcheroni/Matcheroni.hpp") && __has_include("matcheroni/Utilities.hpp")
+#  include "matcheroni/Matcheroni.hpp"
+#  include "matcheroni/Utilities.hpp"
+#  define GRAFITT_HAS_MATCHERONI 1
+#else
+#  define GRAFITT_HAS_MATCHERONI 0
 #endif
 
 namespace grafitt {
@@ -996,4 +1005,120 @@ inline query traversal_from(std::string from, std::size_t depth = 1) {
 
 inline query shortest_path_between(std::string from, std::string to) {
     query q;
-    q.kind = query_kind::p
+    q.kind = query_kind::path;
+    q.body = path_clause{std::move(from), std::move(to), true, std::nullopt};
+    return q;
+}
+
+inline query reachability_between(std::string from, std::string to, std::size_t max_depth = 0) {
+    query q;
+    q.kind = query_kind::reachability;
+    q.body = reachability_clause{std::move(from), std::move(to), max_depth};
+    return q;
+}
+
+inline query aggregate(std::string op, std::string target) {
+    query q;
+    q.kind = query_kind::aggregation;
+    q.body = aggregation_clause{std::move(op), std::move(target), std::nullopt, std::nullopt};
+    return q;
+}
+
+// Text parser boundary: Matcheroni-based structure matching can populate this AST.
+struct parse_output {
+    query value;
+    std::size_t consumed = 0;
+};
+
+[[nodiscard]] inline std::optional<parse_output> parse_text(std::string_view text) {
+    if (text.empty()) return std::nullopt;
+#if GRAFITT_HAS_MATCHERONI
+    using namespace matcheroni;
+    using ws = Any<Atoms<' ', '\t'>>;
+    using alpha = Ranges<'a', 'z', 'A', 'Z', '_', '_'>;
+    using digit = Range<'0', '9'>;
+    using ident = Seq<alpha, Any<alpha, digit>>;
+    using path_stmt = Seq<Lit<"path">, ws, ident, ws, Lit<"->">, ws, ident, End>;
+
+    TextMatchContext ctx;
+    const auto span = utils::to_span(text);
+    if (!path_stmt::match(ctx, span).is_valid()) return std::nullopt;
+
+    auto trimmed = std::string{text};
+    auto arrow = trimmed.find("->");
+    if (arrow == std::string::npos) return std::nullopt;
+
+    auto lhs = trimmed.substr(4, arrow - 4);
+    auto rhs = trimmed.substr(arrow + 2);
+    auto trim = [](std::string s) {
+        auto is_ws = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+        while (!s.empty() && is_ws(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+        while (!s.empty() && is_ws(static_cast<unsigned char>(s.back()))) s.pop_back();
+        return s;
+    };
+    lhs = trim(std::move(lhs));
+    rhs = trim(std::move(rhs));
+    if (lhs.empty() || rhs.empty()) return std::nullopt;
+
+    query q;
+    q.source = std::string{text};
+    q.kind = query_kind::path;
+    q.body = path_clause{std::move(lhs), std::move(rhs), true, std::nullopt};
+    return parse_output{std::move(q), text.size()};
+#else
+    (void)text;
+    return std::nullopt;
+#endif
+}
+
+} // namespace queryfitt
+
+// ============================================================
+// Rewriting placeholders
+// ============================================================
+
+namespace rewrite {
+
+struct rule {
+    std::string name;
+    queryfitt::query match;
+    std::string replacement;
+};
+
+template<class Graph>
+[[nodiscard]] inline Graph apply_once(const Graph& g, const rule&) {
+    return g;
+}
+
+} // namespace rewrite
+
+// ============================================================
+// Serialization hooks and schema lookup
+// ============================================================
+
+namespace gbin {
+
+inline std::filesystem::path schema_root() {
+    if (const char* env = std::getenv("GRAFITT_SCHEMA_DIR")) {
+        if (*env != '\0') return std::filesystem::path{env};
+    }
+    return std::filesystem::path{"specs"};
+}
+
+inline std::filesystem::path default_schema_path() {
+    return schema_root() / "GBIN.sktl";
+}
+
+template<class Graph>
+[[nodiscard]] inline std::vector<std::uint8_t> serialize(const Graph&) {
+    return {};
+}
+
+template<class Graph>
+[[nodiscard]] inline std::optional<Graph> deserialize(const std::vector<std::uint8_t>&) {
+    return std::nullopt;
+}
+
+} // namespace gbin
+
+} // namespace grafitt

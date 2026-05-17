@@ -8,6 +8,8 @@ adapter JSONAdapter
 identity {
   canonical-name "Grafitt Binary Graph Format"
   description "Binary storage format for Grafitt graphs, query metadata, and rewrite payloads."
+  magic "GBIN"
+  version 1
 }
 
 model {
