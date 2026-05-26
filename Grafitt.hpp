@@ -911,7 +911,12 @@ struct path_result {
 };
 
 struct scalar_result {
-    std::variant<std::int64_t, double, std::string, bool> value;
+    using value_type = std::variant<std::int64_t, double, std::string, bool>;
+    value_type value;
+};
+
+struct grouped_scalar_result {
+    std::map<std::string, scalar_result::value_type> groups;
 };
 
 template<class Vertex, class EdgeLabel>
@@ -920,7 +925,8 @@ using result = std::variant<
     std::vector<Vertex>,
     std::vector<path_result<Vertex>>,
     bool,
-    scalar_result
+    scalar_result,
+    grouped_scalar_result
 >;
 
 // ------------------------------------------------------------
@@ -1139,16 +1145,31 @@ struct parse_output {
         std::istringstream bss(body);
         std::string op;
         std::string target;
+        std::optional<predicate_expr> where;
+        std::optional<std::string> by;
+        bool got_head = false;
         while (std::getline(bss, line)) {
             auto t = trim_copy(line);
-            if (!t.empty()) {
+            if (t.empty()) continue;
+            if (!got_head) {
                 std::istringstream lss(t);
                 lss >> op >> target;
-                break;
+                got_head = true;
+                continue;
+            }
+            if (t.rfind("where", 0) == 0) {
+                auto rhs = trim_copy(std::string_view{t}.substr(5));
+                if (!rhs.empty()) where = predicate_expr{std::move(rhs)};
+                continue;
+            }
+            if (t.rfind("by", 0) == 0) {
+                auto rhs = trim_copy(std::string_view{t}.substr(2));
+                if (!rhs.empty()) by = std::move(rhs);
+                continue;
             }
         }
         if (op.empty() || target.empty()) return std::nullopt;
-        q.body = aggregation_clause{std::move(op), std::move(target), std::nullopt, std::nullopt};
+        q.body = aggregation_clause{std::move(op), std::move(target), std::move(where), std::move(by)};
     } else {
         pattern_clause p;
         std::istringstream bss(body);
@@ -1199,12 +1220,165 @@ execute(const Graph& g, const query& q, LabelOf&& label_of, VertexPred&& vpred, 
         auto src = algo::find_vertex_by_label(g, c.from, std::forward<LabelOf>(label_of));
         auto dst = algo::find_vertex_by_label(g, c.to, std::forward<LabelOf>(label_of));
         if (!src || !dst) return false;
-        return algo::reachable(g, *src, *dst);
+        if (c.max_depth == 0) return algo::reachable(g, *src, *dst);
+        if (*src == *dst) return true;
+        std::queue<std::pair<V, std::size_t>> qv;
+        std::unordered_set<V> seen;
+        qv.push({*src, 0});
+        seen.insert(*src);
+        while (!qv.empty()) {
+            auto [cur, depth] = qv.front();
+            qv.pop();
+            if (depth >= c.max_depth) continue;
+            for (const auto& n : g.succ(cur)) {
+                if (n == *dst) return true;
+                if (seen.insert(n).second) qv.push({n, depth + 1});
+            }
+        }
+        return false;
     }
     if (q.kind == query_kind::aggregation) {
         const auto& c = std::get<aggregation_clause>(q.body);
-        if (c.op == "count" && c.target == "vertices") return scalar_result{static_cast<std::int64_t>(g.nb_vertex())};
-        if (c.op == "count" && c.target == "edges") return scalar_result{static_cast<std::int64_t>(g.nb_edges())};
+        if (c.by && *c.by != "all" && *c.by != "vertex_type") {
+            throw query_error("unsupported aggregation by");
+        }
+        const bool by_vertex_type = c.by && *c.by == "vertex_type";
+        auto vertex_type_of = [](const std::string& label) -> std::string {
+            auto t = queryfitt::trim_copy(label);
+            if (t.empty()) return "unknown";
+            const auto colon = t.find(':');
+            if (colon == std::string::npos) return "default";
+            if (colon == 0) {
+                auto rhs = queryfitt::trim_copy(std::string_view{t}.substr(1));
+                return rhs.empty() ? std::string("unknown") : rhs;
+            }
+            auto lhs = queryfitt::trim_copy(std::string_view{t}.substr(0, colon));
+            return lhs.empty() ? std::string("unknown") : lhs;
+        };
+        auto match_where = [&](const std::string& value) -> bool {
+            if (!c.where) return true;
+            const auto& expr = c.where->text;
+            if (expr == "*" || expr == "all" || expr == "true") return true;
+            if (auto pos = expr.find("contains "); pos == 0) {
+                auto needle = queryfitt::trim_copy(std::string_view{expr}.substr(9));
+                return value.find(needle) != std::string::npos;
+            }
+            if (auto pos = expr.find("== "); pos == 0) {
+                auto rhs = queryfitt::trim_copy(std::string_view{expr}.substr(3));
+                return value == rhs;
+            }
+            return value == expr;
+        };
+
+        if (c.op == "count" && c.target == "vertices") {
+            if (!c.where && !by_vertex_type) return scalar_result{static_cast<std::int64_t>(g.nb_vertex())};
+            if (by_vertex_type) {
+                std::map<std::string, scalar_result::value_type> groups;
+                g.iter_vertex([&](const auto& v) {
+                    const auto label = std::invoke(label_of, v);
+                    if (!match_where(label)) return;
+                    auto key = vertex_type_of(label);
+                    auto it = groups.find(key);
+                    if (it == groups.end()) {
+                        groups.emplace(std::move(key), static_cast<std::int64_t>(1));
+                        return;
+                    }
+                    auto* n = std::get_if<std::int64_t>(&it->second);
+                    if (!n) throw query_error("internal aggregation type error");
+                    ++(*n);
+                });
+                return grouped_scalar_result{std::move(groups)};
+            }
+            std::int64_t count = 0;
+            g.iter_vertex([&](const auto& v) {
+                const auto label = std::invoke(label_of, v);
+                if (match_where(label)) ++count;
+            });
+            return scalar_result{count};
+        }
+        if (c.op == "count" && c.target == "edges") {
+            if (by_vertex_type) throw query_error("by vertex_type is unsupported for count edges");
+            if (!c.where) return scalar_result{static_cast<std::int64_t>(g.nb_edges())};
+            std::int64_t count = 0;
+            g.iter_edges_e([&](const auto& e) {
+                if (match_where(to_string_fallback(e.label))) ++count;
+            });
+            return scalar_result{count};
+        }
+        if (c.op == "degree") {
+            auto v = algo::find_vertex_by_label(g, c.target, std::forward<LabelOf>(label_of));
+            if (!v) throw query_error("degree target vertex not found");
+            const auto label = std::invoke(label_of, *v);
+            if (c.where && !match_where(label)) {
+                if (by_vertex_type) return grouped_scalar_result{};
+                return scalar_result{static_cast<std::int64_t>(0)};
+            }
+            const auto deg = static_cast<std::int64_t>(algo::degree(g, *v));
+            if (by_vertex_type) {
+                std::map<std::string, scalar_result::value_type> groups;
+                groups.emplace(vertex_type_of(label), deg);
+                return grouped_scalar_result{std::move(groups)};
+            }
+            return scalar_result{deg};
+        }
+        if (c.target == "degree") {
+            if (by_vertex_type) {
+                std::unordered_map<std::string, std::vector<std::size_t>> grouped_degs;
+                g.iter_vertex([&](const auto& v) {
+                    const auto label = std::invoke(label_of, v);
+                    if (!match_where(label)) return;
+                    grouped_degs[vertex_type_of(label)].push_back(algo::degree(g, v));
+                });
+                std::map<std::string, scalar_result::value_type> out;
+                for (auto& [key, degs] : grouped_degs) {
+                    if (degs.empty()) continue;
+                    if (c.op == "sum") {
+                        std::int64_t sum = 0;
+                        for (auto d : degs) sum += static_cast<std::int64_t>(d);
+                        out.emplace(key, sum);
+                        continue;
+                    }
+                    if (c.op == "avg") {
+                        double sum = 0.0;
+                        for (auto d : degs) sum += static_cast<double>(d);
+                        out.emplace(key, sum / static_cast<double>(degs.size()));
+                        continue;
+                    }
+                    if (c.op == "min") {
+                        out.emplace(key, static_cast<std::int64_t>(*std::min_element(degs.begin(), degs.end())));
+                        continue;
+                    }
+                    if (c.op == "max") {
+                        out.emplace(key, static_cast<std::int64_t>(*std::max_element(degs.begin(), degs.end())));
+                        continue;
+                    }
+                    throw query_error("unsupported aggregation");
+                }
+                return grouped_scalar_result{std::move(out)};
+            }
+            std::vector<std::size_t> degs;
+            g.iter_vertex([&](const auto& v) {
+                const auto label = std::invoke(label_of, v);
+                if (match_where(label)) degs.push_back(algo::degree(g, v));
+            });
+            if (degs.empty()) return scalar_result{static_cast<std::int64_t>(0)};
+            if (c.op == "sum") {
+                std::int64_t sum = 0;
+                for (auto d : degs) sum += static_cast<std::int64_t>(d);
+                return scalar_result{sum};
+            }
+            if (c.op == "avg") {
+                double sum = 0.0;
+                for (auto d : degs) sum += static_cast<double>(d);
+                return scalar_result{sum / static_cast<double>(degs.size())};
+            }
+            if (c.op == "min") {
+                return scalar_result{static_cast<std::int64_t>(*std::min_element(degs.begin(), degs.end()))};
+            }
+            if (c.op == "max") {
+                return scalar_result{static_cast<std::int64_t>(*std::max_element(degs.begin(), degs.end()))};
+            }
+        }
         throw query_error("unsupported aggregation");
     }
     std::vector<match_result<V, E>> out;
@@ -1223,7 +1397,7 @@ execute(const Graph& g, const query& q, LabelOf&& label_of, VertexPred&& vpred, 
 } // namespace queryfitt
 
 // ============================================================
-// Rewriting placeholders
+// Rewriting
 // ============================================================
 
 namespace rewrite {
@@ -1235,6 +1409,41 @@ struct rule {
 };
 
 template<class Graph>
+[[nodiscard]] inline Graph add_vertex(Graph g, const typename Graph::vertex_type& v) {
+    if constexpr (std::is_void_v<decltype(g.add_vertex(v))>) {
+        g.add_vertex(v);
+        return g;
+    } else {
+        return g.add_vertex(v);
+    }
+}
+
+template<class Graph>
+[[nodiscard]] inline Graph add_edge(
+    Graph g,
+    const typename Graph::vertex_type& src,
+    const typename Graph::vertex_type& dst,
+    const typename Graph::edge_label_type& label = {}
+) {
+    if constexpr (std::is_void_v<decltype(g.add_edge(src, dst, label))>) {
+        g.add_edge(src, dst, label);
+        return g;
+    } else {
+        return g.add_edge(src, dst, label);
+    }
+}
+
+template<class Graph>
+[[nodiscard]] inline Graph remove_edge_e(Graph g, const typename Graph::edge_type& e) {
+    if constexpr (std::is_void_v<decltype(g.remove_edge_e(e))>) {
+        g.remove_edge_e(e);
+        return g;
+    } else {
+        return g.remove_edge_e(e);
+    }
+}
+
+template<class Graph>
 [[nodiscard]] inline Graph apply_once(const Graph& g, const rule& r) {
     Graph out = g;
     if (r.replacement.empty()) return out;
@@ -1244,11 +1453,26 @@ template<class Graph>
     auto rhs = queryfitt::trim_copy(std::string_view{r.replacement}.substr(arrow + 2));
     if (lhs.empty() || rhs.empty()) return out;
     if constexpr (std::is_same_v<typename Graph::vertex_type, std::string>) {
+        auto matched = queryfitt::execute(
+            out,
+            r.match,
+            [](const std::string& v) { return v; },
+            [](const std::string&) { return true; },
+            [](const auto&, const auto&) { return true; }
+        );
+        const bool should_apply = std::visit([](const auto& x) -> bool {
+            using T = std::decay_t<decltype(x)>;
+            if constexpr (std::is_same_v<T, bool>) return x;
+            else if constexpr (std::is_same_v<T, queryfitt::scalar_result>) return true;
+            else if constexpr (requires(const T& v) { v.empty(); }) return !x.empty();
+            else return true;
+        }, matched);
+        if (!should_apply) return out;
         if (!out.mem_vertex(lhs)) return out;
-        out.add_vertex(rhs);
+        out = add_vertex(std::move(out), rhs);
         auto succ_edges = out.succ_e(lhs);
-        for (const auto& e : succ_edges) out.remove_edge_e(e);
-        out.add_edge(lhs, rhs);
+        for (const auto& e : succ_edges) out = remove_edge_e(std::move(out), e);
+        out = add_edge(std::move(out), lhs, rhs);
     }
     return out;
 }

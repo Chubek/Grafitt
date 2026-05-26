@@ -1,4 +1,4 @@
-#include "grafitt.hpp"
+#include "Grafitt.hpp"
 #include <iostream>
 #include <string>
 

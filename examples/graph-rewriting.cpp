@@ -1,16 +1,18 @@
-using G = grafitt::persistent_labeled_digraph<std::string, std::string>;
+#include "Grafitt.hpp"
+#include <string>
 
-grafitt::rewrite::rule<std::string, std::string> r;
-r.name = "InsertMediator";
-r.pattern.count = 2;
-r.pattern.vertex_type = "Person";
-r.replacement_vertices = [](const auto&) {
-    return std::vector<std::string>{"Charlie"};
-};
-r.replacement_edges = [](const auto& m) {
-    if (m.vertices.size() < 2) return std::vector<grafitt::edge<std::string, std::string>>{};
-    return std::vector<grafitt::edge<std::string, std::string>>{
-        {m.vertices[0], "Charlie", "friend"},
-        {"Charlie", m.vertices[1], "friend"}
+int main() {
+    using G = grafitt::persistent_graph<std::string, std::string>;
+    G g;
+    g = g.add_edge("Alice", "Bob", "friend");
+    g = g.add_edge("Alice", "Carol", "friend");
+
+    grafitt::rewrite::rule r{
+        .name = "RedirectFromAlice",
+        .match = grafitt::queryfitt::aggregate("count", "edges"),
+        .replacement = "Alice->Charlie"
     };
-};
+
+    auto g2 = grafitt::rewrite::apply_once(g, r);
+    return g2.mem_edge("Alice", "Charlie") ? 0 : 1;
+}

@@ -19,7 +19,8 @@ Implemented now:
 - OCamlGraph-style iteration/fold helpers
 - core algorithms (`reachable`, `shortest_path`, `bfs_order`)
 - Queryfitt textual parsing for `match` / `traverse` / `path` / `reachable` / `aggregate`
-- Queryfitt execution for traversal, shortest path, reachability, basic aggregation, and edge-oriented pattern matches
+- Queryfitt execution for traversal, shortest path, reachability (including `max_depth`), aggregation, and edge-oriented pattern matches
+  - aggregation supports `count`, `degree`, `sum/avg/min/max degree`, with optional `where` and `by all|vertex_type` (`by vertex_type` returns per-group results)
 - concrete rewrite `apply_once()` behavior for string-vertex graphs (`lhs->rhs`)
 - GBIN v1 serializer/deserializer with schema lookup hooks (`GRAFITT_SCHEMA_DIR`, fallback `specs/`)
 
@@ -164,6 +165,15 @@ int main() {
 - optional metadata block (`--- ... ---`)
 - `match`, `traverse`, `path`, `reachable`, `aggregate`
 - `in "..." { ... }` body with clause-specific fields
+
+Aggregation-focused runnable examples:
+- `examples/aggregation-count.cpp`
+- `examples/aggregation-where.cpp`
+- `examples/aggregation-by-vertex-type.cpp`
+- `examples/aggregation-degree-stats.cpp`
+- `examples/aggregation-degree-by-vertex-type.cpp`
+- `examples/aggregation-parse-text.cpp`
+- textual samples: `examples/aggregation-by-type.qfitt`, `examples/aggregation-where-by-type.qfitt`, `examples/aggregation-degree-by-type.qfitt`
 
 ```cpp
 #include "Grafitt.hpp"
