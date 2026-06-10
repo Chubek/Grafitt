@@ -12,6 +12,18 @@ Quick map of the sample programs and query files.
 | `queryfitt-exec.cpp` | Native Queryfitt query execution |
 | `find-pattern.cpp` | Embedded pattern DSL construction |
 | `graph-rewriting.cpp` | Rewrite rule application (`apply_once`) |
+| `subgraph-matching.cpp` | Exact + constrained heuristic subgraph matching |
+| `subgraph-matching-induced.cpp` | Induced vs non-induced subgraph matching behavior |
+| `rewrite-subgraph-match.cpp` | Rewrite flow driven by subgraph match witnesses/bindings |
+| `rewrite-subgraph-strategies.cpp` | Strategy-based subgraph rewrite scheduling and stats |
+| `rewrite-subgraph-dsl-tags.cpp` | Optional DSLUtils pattern-tag constrained matching/rewrite |
+| `decomposition-covering.cpp` | DAG/forest covering with validation and export hooks |
+| `decomposition-cover-scoring.cpp` | Strategy/objective-driven cover comparison and scoring |
+| `eqsat-basic.cpp` | Minimal equality-saturation build/saturate/extract workflow |
+| `plugin-eqsat-pass.cpp` | C++ pass pipeline using built-in eqsat transform pass |
+| `module-minimal.c` | Minimal C ABI module exporting metadata/start/end symbols |
+| `module-host-minimal.cpp` | Host-side module staging/start/stop lifecycle management |
+| `gbin-diagnostics.cpp` | GBIN header inspection and detailed decode diagnostics |
 | `aggregation-count.cpp` | `count vertices` scalar aggregation |
 | `aggregation-where.cpp` | Aggregation with `where` filtering |
 | `aggregation-by-vertex-type.cpp` | Grouped `count vertices by vertex_type` |

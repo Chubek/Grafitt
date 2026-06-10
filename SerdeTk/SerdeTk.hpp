@@ -6,6 +6,7 @@
 #include "DSLUtils.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <ostream>
 #include <regex>
@@ -427,7 +429,12 @@ public:
                     for (const auto& item : cur->as_array().items) out.values.push_back(&item);
                     return out;
                 }
-                const std::size_t idx = static_cast<std::size_t>(std::stoull(token));
+                std::size_t idx = 0;
+                try {
+                    idx = static_cast<std::size_t>(std::stoull(token));
+                } catch (...) {
+                    return {};
+                }
                 if (idx >= cur->as_array().items.size()) return {};
                 cur = &cur->as_array().items[idx];
                 i = e + 1;
@@ -1402,6 +1409,216 @@ inline void emit_sexpr_value(std::ostringstream& out, const Value& v) {
     if (v.is_double()) { out << std::get<double>(v.data); return; }
     out << "<binary>";
 }
+
+class CborParser {
+public:
+    explicit CborParser(const std::vector<std::uint8_t>& bytes) : bytes_(bytes) {}
+    Value parse_value() {
+        if (eof()) throw ParseError("Invalid CBOR: truncated input");
+        const std::uint8_t ib = next();
+        const std::uint8_t major = static_cast<std::uint8_t>(ib >> 5);
+        const std::uint8_t ai = static_cast<std::uint8_t>(ib & 0x1f);
+        switch (major) {
+            case 0: return parse_uint(ai);
+            case 1: return parse_nint(ai);
+            case 2: return parse_bytes(ai);
+            case 3: return parse_text(ai);
+            case 4: return parse_array(ai);
+            case 5: return parse_map(ai);
+            case 7: return parse_simple(ai);
+            default: throw ParseError("Invalid CBOR: unsupported major type");
+        }
+    }
+    void expect_end() const {
+        if (!eof()) throw ParseError("Invalid CBOR: trailing bytes");
+    }
+
+private:
+    std::uint64_t read_len(std::uint8_t ai) {
+        if (ai <= 23) return ai;
+        if (ai == 24) return read_u8();
+        if (ai == 25) return read_u16();
+        if (ai == 26) return read_u32();
+        if (ai == 27) return read_u64();
+        if (ai == 31) throw ParseError("Invalid CBOR: indefinite lengths unsupported");
+        throw ParseError("Invalid CBOR: invalid additional information");
+    }
+    std::uint8_t read_u8() {
+        if (remaining() < 1) throw ParseError("Invalid CBOR: truncated integer");
+        return next();
+    }
+    std::uint16_t read_u16() {
+        if (remaining() < 2) throw ParseError("Invalid CBOR: truncated integer");
+        const std::uint16_t a = next();
+        const std::uint16_t b = next();
+        return static_cast<std::uint16_t>((a << 8) | b);
+    }
+    std::uint32_t read_u32() {
+        if (remaining() < 4) throw ParseError("Invalid CBOR: truncated integer");
+        std::uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) v = static_cast<std::uint32_t>((v << 8) | next());
+        return v;
+    }
+    std::uint64_t read_u64() {
+        if (remaining() < 8) throw ParseError("Invalid CBOR: truncated integer");
+        std::uint64_t v = 0;
+        for (int i = 0; i < 8; ++i) v = static_cast<std::uint64_t>((v << 8) | next());
+        return v;
+    }
+    Value parse_uint(std::uint8_t ai) {
+        return Value(read_len(ai));
+    }
+    Value parse_nint(std::uint8_t ai) {
+        const auto u = read_len(ai);
+        if (u > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            throw ParseError("Invalid CBOR: negative integer out of range");
+        }
+        return Value(static_cast<std::int64_t>(-1 - static_cast<std::int64_t>(u)));
+    }
+    Value parse_bytes(std::uint8_t ai) {
+        const auto n = read_len(ai);
+        if (remaining() < n) throw ParseError("Invalid CBOR: truncated byte string");
+        std::vector<std::uint8_t> out;
+        out.reserve(static_cast<std::size_t>(n));
+        for (std::uint64_t i = 0; i < n; ++i) out.push_back(next());
+        return Value(Binary{std::move(out)});
+    }
+    Value parse_text(std::uint8_t ai) {
+        const auto n = read_len(ai);
+        if (remaining() < n) throw ParseError("Invalid CBOR: truncated text string");
+        std::string out;
+        out.reserve(static_cast<std::size_t>(n));
+        for (std::uint64_t i = 0; i < n; ++i) out.push_back(static_cast<char>(next()));
+        return Value(std::move(out));
+    }
+    Value parse_array(std::uint8_t ai) {
+        const auto n = read_len(ai);
+        auto arr = std::make_shared<Array>();
+        arr->items.reserve(static_cast<std::size_t>(n));
+        for (std::uint64_t i = 0; i < n; ++i) arr->push(parse_value());
+        return Value(arr);
+    }
+    Value parse_map(std::uint8_t ai) {
+        const auto n = read_len(ai);
+        auto obj = std::make_shared<Object>();
+        for (std::uint64_t i = 0; i < n; ++i) {
+            Value key = parse_value();
+            if (!key.is_string()) throw ParseError("Invalid CBOR: map key must be text string");
+            obj->set(key.as_string(), parse_value());
+        }
+        return Value(obj);
+    }
+    Value parse_simple(std::uint8_t ai) {
+        if (ai == 26) return Value(parse_f32());
+        if (ai == 27) return Value(parse_f64());
+        if (ai == 20) return Value(false);
+        if (ai == 21) return Value(true);
+        if (ai == 22) return Value(nullptr);
+        throw ParseError("Invalid CBOR: unsupported simple value");
+    }
+    double parse_f32() {
+        const std::uint32_t bits = read_u32();
+        float f = std::bit_cast<float>(bits);
+        return static_cast<double>(f);
+    }
+    double parse_f64() {
+        const std::uint64_t bits = read_u64();
+        return std::bit_cast<double>(bits);
+    }
+    bool eof() const noexcept { return pos_ >= bytes_.size(); }
+    std::size_t remaining() const noexcept { return bytes_.size() - pos_; }
+    std::uint8_t next() { return bytes_[pos_++]; }
+
+    const std::vector<std::uint8_t>& bytes_;
+    std::size_t pos_ {0};
+};
+
+inline void cbor_emit_len(std::vector<std::uint8_t>& out, std::uint8_t major, std::uint64_t n) {
+    const std::uint8_t head = static_cast<std::uint8_t>(major << 5);
+    if (n <= 23) {
+        out.push_back(static_cast<std::uint8_t>(head | static_cast<std::uint8_t>(n)));
+        return;
+    }
+    if (n <= 0xff) {
+        out.push_back(static_cast<std::uint8_t>(head | 24));
+        out.push_back(static_cast<std::uint8_t>(n));
+        return;
+    }
+    if (n <= 0xffff) {
+        out.push_back(static_cast<std::uint8_t>(head | 25));
+        out.push_back(static_cast<std::uint8_t>((n >> 8) & 0xff));
+        out.push_back(static_cast<std::uint8_t>(n & 0xff));
+        return;
+    }
+    if (n <= 0xffffffffULL) {
+        out.push_back(static_cast<std::uint8_t>(head | 26));
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            out.push_back(static_cast<std::uint8_t>((n >> shift) & 0xff));
+        }
+        return;
+    }
+    out.push_back(static_cast<std::uint8_t>(head | 27));
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        out.push_back(static_cast<std::uint8_t>((n >> shift) & 0xff));
+    }
+}
+
+inline void cbor_emit_value(std::vector<std::uint8_t>& out, const Value& v) {
+    if (v.is_null()) {
+        out.push_back(0xf6);
+        return;
+    }
+    if (v.is_bool()) {
+        out.push_back(std::get<bool>(v.data) ? 0xf5 : 0xf4);
+        return;
+    }
+    if (v.is_uint()) {
+        cbor_emit_len(out, 0, std::get<std::uint64_t>(v.data));
+        return;
+    }
+    if (v.is_int()) {
+        const auto i = std::get<std::int64_t>(v.data);
+        if (i >= 0) {
+            cbor_emit_len(out, 0, static_cast<std::uint64_t>(i));
+            return;
+        }
+        cbor_emit_len(out, 1, static_cast<std::uint64_t>(-1 - i));
+        return;
+    }
+    if (v.is_double()) {
+        out.push_back(0xfb);
+        const std::uint64_t bits = std::bit_cast<std::uint64_t>(std::get<double>(v.data));
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            out.push_back(static_cast<std::uint8_t>((bits >> shift) & 0xff));
+        }
+        return;
+    }
+    if (v.is_string()) {
+        const auto& s = v.as_string();
+        cbor_emit_len(out, 3, static_cast<std::uint64_t>(s.size()));
+        out.insert(out.end(), s.begin(), s.end());
+        return;
+    }
+    if (v.is_binary()) {
+        const auto& b = v.as_binary().bytes;
+        cbor_emit_len(out, 2, static_cast<std::uint64_t>(b.size()));
+        out.insert(out.end(), b.begin(), b.end());
+        return;
+    }
+    if (v.is_array()) {
+        const auto& a = v.as_array().items;
+        cbor_emit_len(out, 4, static_cast<std::uint64_t>(a.size()));
+        for (const auto& item : a) cbor_emit_value(out, item);
+        return;
+    }
+    const auto& o = v.as_object().fields;
+    cbor_emit_len(out, 5, static_cast<std::uint64_t>(o.size()));
+    for (const auto& kv : o) {
+        cbor_emit_len(out, 3, static_cast<std::uint64_t>(kv.first.size()));
+        out.insert(out.end(), kv.first.begin(), kv.first.end());
+        cbor_emit_value(out, kv.second);
+    }
+}
 } // namespace detail
 
 inline Document CompiledFormat::load_file(const std::filesystem::path& path) const { return is_textual() ? load_string(read_text_file(path)) : load_bytes(read_binary_file(path)); }
@@ -1451,6 +1668,24 @@ inline CompiledFormat xml() { CompiledFormat fmt("XML"); fmt.category = FormatCa
 inline CompiledFormat sexpr() { CompiledFormat fmt("S-Expr"); fmt.category = FormatCategory::Textual; fmt.extensions = {".sexpr", ".scm", ".lisp"}; fmt.load_string_fn = [](std::string_view t){ return detail::parse_sexpr_basic(t); }; fmt.dump_string_fn = [](const Document& d, const formatting::Options&){ std::ostringstream out; detail::emit_sexpr_value(out, d.root); return out.str(); }; return fmt; }
 inline CompiledFormat messagepack() { CompiledFormat fmt("MessagePack"); fmt.category = FormatCategory::Binary; fmt.extensions = {".msgpack", ".mpack"}; fmt.load_bytes_fn = [](const std::vector<std::uint8_t>& b){ if (b.size() >= 4 && b[0]=='S' && b[1]=='T' && b[2]=='K' && b[3]=='J') return builtins::json().load_string(std::string(reinterpret_cast<const char*>(b.data()+4), b.size()-4)); Document d; d.root = Value(Binary{b}); return d; }; fmt.dump_bytes_fn = [](const Document& d){ if (d.root.is_binary()) return d.root.as_binary().bytes; const auto s = builtins::json().dump_string(d); std::vector<std::uint8_t> out{'S','T','K','J'}; out.insert(out.end(), s.begin(), s.end()); return out; }; return fmt; }
 inline CompiledFormat bson() { CompiledFormat fmt("BSON"); fmt.category = FormatCategory::Binary; fmt.extensions = {".bson"}; fmt.load_bytes_fn = [](const std::vector<std::uint8_t>& b){ if (b.size() >= 4 && b[0]=='S' && b[1]=='T' && b[2]=='K' && b[3]=='J') return builtins::json().load_string(std::string(reinterpret_cast<const char*>(b.data()+4), b.size()-4)); Document d; d.root = Value(Binary{b}); return d; }; fmt.dump_bytes_fn = [](const Document& d){ if (d.root.is_binary()) return d.root.as_binary().bytes; const auto s = builtins::json().dump_string(d); std::vector<std::uint8_t> out{'S','T','K','J'}; out.insert(out.end(), s.begin(), s.end()); return out; }; return fmt; }
+inline CompiledFormat cbor() {
+    CompiledFormat fmt("CBOR");
+    fmt.category = FormatCategory::Binary;
+    fmt.extensions = {".cbor"};
+    fmt.load_bytes_fn = [](const std::vector<std::uint8_t>& b) {
+        detail::CborParser parser(b);
+        Document d;
+        d.root = parser.parse_value();
+        parser.expect_end();
+        return d;
+    };
+    fmt.dump_bytes_fn = [](const Document& d) {
+        std::vector<std::uint8_t> out;
+        detail::cbor_emit_value(out, d.root);
+        return out;
+    };
+    return fmt;
+}
 } // namespace builtins
 
 namespace sktl {
@@ -1496,6 +1731,7 @@ inline CompiledFormat compile(const Descriptor& d) {
     else if (d.name == "S-Expr") fmt = builtins::sexpr();
     else if (d.name == "MessagePack") fmt = builtins::messagepack();
     else if (d.name == "BSON") fmt = builtins::bson();
+    else if (d.name == "CBOR") fmt = builtins::cbor();
     else throw FormatError("No builtin compiler backend for SKTL format: " + d.name);
 
     fmt.name = d.name;
@@ -1527,6 +1763,7 @@ inline void register_builtin_formats(FormatRegistry& registry = FormatRegistry::
     registry.register_format(builtins::sexpr());
     registry.register_format(builtins::messagepack());
     registry.register_format(builtins::bson());
+    registry.register_format(builtins::cbor());
 }
 
 template <typename Adapter>
@@ -1534,7 +1771,6 @@ struct Convert {
     static Document run(const Document& input, conversion::Report* report = nullptr, conversion::Policy = conversion::Policy::BestEffort) {
         if (report) {
             report->warnings.push_back("Adapter conversion path used");
-            report->losses.push_back(conversion::LossKind::Placeholder);
         }
         return Adapter::from_common(Adapter::to_common(input, report), report);
     }
@@ -1587,6 +1823,7 @@ namespace yaml { struct JSONAdapter { static Document to_common(const Document& 
 namespace xml { struct JSONAdapter { static Document to_common(const Document& in, conversion::Report* r) { if (r) r->losses.push_back(conversion::LossKind::AttributeLoss); return in; } static Document from_common(const Document& in, conversion::Report* r) { if (r) r->losses.push_back(conversion::LossKind::AttributeLoss); return in; } }; }
 namespace bson { struct JSONAdapter { static Document to_common(const Document& in, conversion::Report* r) { if (r) r->losses.push_back(conversion::LossKind::BinaryCarrier); return in; } static Document from_common(const Document& in, conversion::Report* r) { if (r) r->losses.push_back(conversion::LossKind::BinaryCarrier); return in; } }; }
 namespace msgpack { struct JSONAdapter { static Document to_common(const Document& in, conversion::Report* r) { if (r) r->losses.push_back(conversion::LossKind::BinaryCarrier); return in; } static Document from_common(const Document& in, conversion::Report* r) { if (r) r->losses.push_back(conversion::LossKind::BinaryCarrier); return in; } }; }
+namespace cbor { struct JSONAdapter { static Document to_common(const Document& in, conversion::Report* r) { if (r) r->losses.push_back(conversion::LossKind::BinaryCarrier); return in; } static Document from_common(const Document& in, conversion::Report* r) { if (r) r->losses.push_back(conversion::LossKind::BinaryCarrier); return in; } }; }
 
 namespace json {
 inline const CompiledFormat& format() { static CompiledFormat fmt = builtins::json(); return fmt; }
@@ -1636,6 +1873,7 @@ SERDETK_DEFINE_FORMAT_NS(xml, xml)
 SERDETK_DEFINE_FORMAT_NS(sexpr, sexpr)
 SERDETK_DEFINE_FORMAT_NS(msgpack, messagepack)
 SERDETK_DEFINE_FORMAT_NS(bson, bson)
+SERDETK_DEFINE_FORMAT_NS(cbor, cbor)
 
 #undef SERDETK_DEFINE_FORMAT_NS
 
