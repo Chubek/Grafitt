@@ -36,12 +36,11 @@ Implemented now:
 ## Requirements
 
 - C++20 compiler
-- optional local headers (auto-detected):
-  - `DSLUtils.hpp`
-  - `SerdeTk.hpp`
-  - `matcheroni/Matcheroni.hpp` + `matcheroni/Utilities.hpp`
+- optional local headers (auto-detected via `__has_include`):
+  - `DSLtk.hpp` (or `MetaTk/DSLtk/DSLtk.hpp`) — MetaTk DSLtk PEG parser + pattern matching, powers Queryfitt syntax validation and DSL-tagged subgraph matching. Exposed as `GRAFITT_HAS_DSLTK` (and the legacy `GRAFITT_HAS_DSLUTILS` alias).
+  - `SerdeTk.hpp` — SerdeTk serialization header. Exposed as `GRAFITT_HAS_SERDETK`.
 
-The header compiles without optional integrations; corresponding features degrade to narrow stubs.
+The header compiles without optional integrations; corresponding features degrade to narrow stubs. (The previous `matcheroni`/`DSLUtils.hpp` dependency was replaced by MetaTk DSLtk.)
 
 ## Quick Start
 
